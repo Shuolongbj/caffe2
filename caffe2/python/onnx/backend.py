@@ -44,7 +44,10 @@ from onnx.backend.base import Backend, Device, DeviceType, namedtupledict
 
 from caffe2.python.onnx.workspace import Workspace
 from caffe2.python.onnx.backend_rep import Caffe2Rep
+from caffe2.python.onnx.backend_cpp_rep import Caffe2CppRep
 from caffe2.python.onnx.helper import dummy_name
+
+import caffe2.python._import_c_extension as C
 
 import warnings
 
@@ -76,7 +79,6 @@ class OnnxAttributes(dict):
         for k, v in self.items():
             if kmap(k) != '':
                 yield caffe2.python.utils.MakeArgument(kmap(k), v)
-
 
 # TODO: Move this into ONNX main library
 def convertAttributeProto(onnx_arg):
@@ -205,8 +207,8 @@ class Caffe2Backend(Backend):
     # so this interface MAY make BC-breaking changes.  Specify an
     # opset_version if you don't want this to version.
     @classmethod
-    def run_node(cls, node, inputs, device='CPU', opset_version=_known_opset_version):
-        super(Caffe2Backend, cls).run_node(node, inputs, device)
+    def run_node(cls, node, inputs, device='CPU', opset_version=_known_opset_version, outputs_info=None):
+        super(Caffe2Backend, cls).run_node(node, inputs, device=device, outputs_info=outputs_info)
 
         device_option = get_device_option(Device(device))
         with Workspace(), core.DeviceScope(device_option):  # temporary!
@@ -219,12 +221,23 @@ class Caffe2Backend(Backend):
                 for key, value in zip(node.input, inputs):
                     workspace.FeedBlob(key, value)
 
-            cls._inplace_rewrite([node])
-            init_ops, ops, _ = cls._onnx_node_to_caffe2_op(
-                None, None, node, opset_version or cls._known_opset_version)
-            ops = init_ops + ops
-            for op in ops:
+            ops = []
+            cbackend = C.Caffe2Backend()
+            ops_str = cbackend.convert_node(node.SerializeToString(), opset_version)
+            for s in ops_str:
+                op = caffe2_pb2.OperatorDef()
+                op.ParseFromString(s)
                 op.device_option.CopyFrom(device_option)
+                ops.append(op)
+            cls._inplace_rewrite([node])
+            # For testing
+            if "ONNX_CAFFE2_DEBUG" in os.environ:
+                init_ops, ops2, _ = cls._onnx_node_to_caffe2_op(
+                    None, None, node, opset_version or cls._known_opset_version)
+                ops2 = init_ops + ops2
+                for op in ops2:
+                    op.device_option.CopyFrom(device_option)
+                print("\nC++:\n{}\nPython:\n{}".format(ops, ops2))
             workspace.RunOperatorsOnce(ops)
             output_values = [workspace.FetchBlob(name) for name in node.output]
             return namedtupledict('Outputs', node.output)(*output_values)
@@ -383,6 +396,10 @@ class Caffe2Backend(Backend):
             prev = prev[0]
             if prev.op_type == n.op_type:
                 return prev.attrs['hidden_size']
+            if prev.op_type == 'Transpose':
+                for x in pred_model.graph.input:
+                    if x.name == prev.inputs[0]:
+                        return x.type.tensor_type.shape.dim[2].dim_value
             curr = prev
 
     @classmethod
@@ -450,7 +467,7 @@ class Caffe2Backend(Backend):
                 input_size,
                 hidden_size,
                 name,
-                drop_states=True,
+                drop_states=False,
                 forward_only=True,
                 activation=activation
             )
@@ -463,9 +480,15 @@ class Caffe2Backend(Backend):
 
         if direction == 'forward':
             hidden_t_all, hidden_t_last = make_rnn(0)
+
+            # in the forward case, storage is shared between the two
+            # outputs. We need to decouple them so that the
+            # VariableLengthSequencePadding only mutates n.outputs[0]
+            pred_mh.net.Copy(hidden_t_last, n.outputs[1])
+
             pred_mh.net = pred_mh.net.Clone(
                 "dummy-clone-net",
-                blob_remap={ hidden_t_all: n.outputs[0], hidden_t_last: n.outputs[1] }
+                blob_remap={ hidden_t_all: n.outputs[0] }
             )
         elif direction == 'bidirectional':
             hidden_t_all_f, hidden_t_last_f = make_rnn(0)
@@ -473,7 +496,11 @@ class Caffe2Backend(Backend):
             pred_mh.net.Concat([hidden_t_all_f, hidden_t_all_b],
                                [n.outputs[0], dummy_name()], axis=2)
             pred_mh.net.Concat([hidden_t_last_f, hidden_t_last_b],
-                               [n.outputs[1], dummy_name()], axis=2)
+                               [n.outputs[1], dummy_name()], axis=0)
+
+        if sequence_lens is not None:
+            pred_mh.net.VariableLengthSequencePadding(
+                [n.outputs[0], sequence_lens], [n.outputs[0]])
 
         return Caffe2Ops(list(pred_mh.Proto().op),
                          list(init_net.Proto().op),
@@ -561,7 +588,7 @@ class Caffe2Backend(Backend):
                 input_size,
                 hidden_size,
                 name,
-                drop_states=True,
+                drop_states=False,
                 forward_only=True,
                 return_params=True
             )
@@ -573,22 +600,31 @@ class Caffe2Backend(Backend):
             return hidden_t_all, hidden_t_last, cell_last
 
         if direction == 'forward':
-            hidden_t_all, hidden_t_last, cell_all = make_lstm(0)
+            hidden_t_all, hidden_t_last, cell_last = make_lstm(0)
+
+            # in the forward case, storage is shared between the three
+            # outputs. We need to decouple them so that the
+            # VariableLengthSequencePadding only mutates n.outputs[0]
+            pred_mh.net.Copy(hidden_t_last, n.outputs[1])
+            pred_mh.net.Copy(cell_last, n.outputs[2])
+
             pred_mh.net = pred_mh.net.Clone(
                 "dummy-clone-net",
-                blob_remap={hidden_t_all: n.outputs[0],
-                            hidden_t_last: n.outputs[1],
-                            cell_all: n.outputs[2]}
+                blob_remap={ hidden_t_all: n.outputs[0] }
             )
         elif direction == 'bidirectional':
-            hidden_t_all_f, hidden_t_last_f, cell_all_f = make_lstm(0)
-            hidden_t_all_b, hidden_t_last_b, cell_all_b = make_lstm(1)
+            hidden_t_all_f, hidden_t_last_f, cell_last_f = make_lstm(0)
+            hidden_t_all_b, hidden_t_last_b, cell_last_b = make_lstm(1)
             pred_mh.net.Concat([hidden_t_all_f, hidden_t_all_b],
                                [n.outputs[0], dummy_name()], axis=2)
             pred_mh.net.Concat([hidden_t_last_f, hidden_t_last_b],
-                               [n.outputs[1], dummy_name()], axis=2)
-            pred_mh.net.Concat([cell_all_f, cell_all_b],
-                               [n.outputs[2], dummy_name()], axis=2)
+                               [n.outputs[1], dummy_name()], axis=0)
+            pred_mh.net.Concat([cell_last_f, cell_last_b],
+                               [n.outputs[2], dummy_name()], axis=0)
+
+        if sequence_lens is not None:
+            pred_mh.net.VariableLengthSequencePadding(
+                [n.outputs[0], sequence_lens], [n.outputs[0]])
 
         return Caffe2Ops(list(pred_mh.Proto().op),
                          list(init_net.Proto().op),
@@ -674,7 +710,7 @@ class Caffe2Backend(Backend):
                 input_size,
                 hidden_size,
                 name,
-                drop_states=True,
+                drop_states=False,
                 forward_only=True,
                 linear_before_reset=linear_before_reset
             )
@@ -687,9 +723,15 @@ class Caffe2Backend(Backend):
 
         if direction == 'forward':
             hidden_t_all, hidden_t_last = make_gru(0)
+
+            # in the forward case, storage is shared between the two
+            # outputs. We need to decouple them so that the
+            # VariableLengthSequencePadding only mutates n.outputs[0]
+            pred_mh.net.Copy(hidden_t_last, n.outputs[1])
+
             pred_mh.net = pred_mh.net.Clone(
                 "dummy-clone-net",
-                blob_remap={ hidden_t_all: n.outputs[0], hidden_t_last: n.outputs[1] }
+                blob_remap={ hidden_t_all: n.outputs[0] }
             )
         elif direction == 'bidirectional':
             hidden_t_all_f, hidden_t_last_f = make_gru(0)
@@ -697,7 +739,11 @@ class Caffe2Backend(Backend):
             pred_mh.net.Concat([hidden_t_all_f, hidden_t_all_b],
                                [n.outputs[0], dummy_name()], axis=2)
             pred_mh.net.Concat([hidden_t_last_f, hidden_t_last_b],
-                               [n.outputs[1], dummy_name()], axis=2)
+                               [n.outputs[1], dummy_name()], axis=0)
+
+        if sequence_lens is not None:
+            pred_mh.net.VariableLengthSequencePadding(
+                [n.outputs[0], sequence_lens], [n.outputs[0]])
 
         return Caffe2Ops(list(pred_mh.Proto().op),
                          list(init_net.Proto().op),
@@ -949,8 +995,6 @@ class Caffe2Backend(Backend):
         there is no way we can know which blob is the input of the predict_graph.
         '''
         super(Caffe2Backend, cls).prepare(model, device, **kwargs)
-
-
         opset_version = None
         for imp in model.opset_import:
             if not imp.HasField("domain") or imp.domain == "":
@@ -965,31 +1009,78 @@ class Caffe2Backend(Backend):
             else:
                 opset_version = 1
 
-        ws = Workspace()
-        device_option = get_device_option(Device(device))
+        # Check whether we have RNN related ops
+        pred_model = ModelProto()
+        pred_model.ParseFromString(cls.optimize_onnx(model.SerializeToString(), predict=True))
+        cls._inplace_rewrite(pred_model.graph)
+        rnn_nodes = []
+        for node in pred_model.graph.node:
+            if node.op_type in {'LSTM', 'GRU', 'RNN'}:
+                rnn_nodes.append(node)
 
-        # Directly load initializer data into blobs in workspace
-        cls._direct_initialize_parameters(
-            model.graph.initializer,
-            ws,
-            device_option,
-        )
+        # Build the C++ backend
+        # TODO: build a predictor that supports GPU
+        #       And for RNN nets, we need to avoid adding init_net
+        if device == 'CPU' and not rnn_nodes:
+            c2_rnn_ops = []
+            if rnn_nodes:
+                init_model = ModelProto()
+                init_model.ParseFromString(cls.optimize_onnx(model.SerializeToString(), init=True))
+                cls._inplace_rewrite(init_model.graph)
+                for node in rnn_nodes:
+                    c2ops = cls._onnx_node_to_caffe2_op(
+                        init_model, pred_model, node, opset_version)
+                    init_ops = [x.SerializeToString() for x in c2ops.init_ops]
+                    ops = [x.SerializeToString() for x in c2ops.ops]
+                    external_inputs = c2ops.interface_blobs
+                    c2_rnn_ops.append(C.Caffe2Ops(init_ops, ops, external_inputs))
+                del init_model
 
-        initialized = {init.name for init in model.graph.initializer}
+            cbackend = C.Caffe2Backend()
+            rep = cbackend.prepare(model.SerializeToString(), device, c2_rnn_ops)
+            # For testing
+            # Dump the net descritpions to file for comparison with the Python ones
+            if "ONNX_CAFFE2_DEBUG" in os.environ:
+                pred_net_str = rep.pred_net()
+                pn = caffe2_pb2.NetDef()
+                pn.ParseFromString(pred_net_str)
+                init_net_str = rep.init_net()
+                inn = caffe2_pb2.NetDef()
+                inn.ParseFromString(init_net_str)
+                with open("cpp.txt", "w") as f:
+                    f.write("pred_net: \n{}".format(pn))
 
-        cls._direct_initialize_inputs(
-            model.graph.input,
-            initialized,
-            ws,
-            device_option,
-        )
+            rep_wrapper = Caffe2CppRep(rep)
+            return rep_wrapper
+        else:
+            ws = Workspace()
+            device_option = get_device_option(Device(device))
 
-        uninitialized = [value_info.name for value_info in model.graph.input if value_info.name not in initialized]
+            # Directly load initializer data into blobs in workspace
+            cls._direct_initialize_parameters(
+                model.graph.initializer,
+                ws,
+                device_option,
+            )
 
-        init_net, predict_net = cls._onnx_model_to_caffe2_net(model, device, opset_version, False)
+            initialized = {init.name for init in model.graph.initializer}
 
-        retval = Caffe2Rep(init_net, predict_net, ws, uninitialized)
-        return retval
+            cls._direct_initialize_inputs(
+                model.graph.input,
+                initialized,
+                ws,
+                device_option,
+            )
+
+            uninitialized = [value_info.name for value_info in model.graph.input if value_info.name not in initialized]
+
+            init_net, predict_net = cls._onnx_model_to_caffe2_net(model, device, opset_version, False)
+            if "ONNX_CAFFE2_DEBUG" in os.environ:
+                with open("python.txt", "w") as f:
+                    f.write("pred_net: \n{}".format(predict_net))
+            retval = Caffe2Rep(init_net, predict_net, ws, uninitialized)
+            return retval
+
 
     @classmethod
     # TODO: This method needs a refactor for clarity
@@ -1124,11 +1215,17 @@ class Caffe2Backend(Backend):
 
         dummy_name(cls._all_names_in_graph(init_model.graph) | cls._all_names_in_graph(pred_model.graph))
 
+        success = True
         for net, model in ( (init_net, init_model), (pred_net, pred_model) ):
             net.device_option.CopyFrom(device_option)
             for node in model.graph.node:
-                c2ops = cls._onnx_node_to_caffe2_op(
-                    init_model, pred_model, node, opset_version)
+                try:
+                    c2ops = cls._onnx_node_to_caffe2_op(
+                        init_model, pred_model, node, opset_version)
+                except Exception as e:
+                    success = False
+                    print('ONNX FATAL:', e)
+                    continue
                 (init_net if include_initializers else net).op.extend(c2ops.init_ops)
                 net.op.extend(c2ops.ops)
                 net.external_input.extend(c2ops.interface_blobs)
@@ -1136,6 +1233,9 @@ class Caffe2Backend(Backend):
                 value_info.name for value_info in model.graph.output)
             net.external_input.extend(
                 value_info.name for value_info in model.graph.input)
+
+        if not success:
+            raise RuntimeError('ONNX conversion failed')
 
         return init_net, pred_net
 
